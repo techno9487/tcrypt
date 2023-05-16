@@ -3,6 +3,7 @@ import os
 import json
 import argparse
 import urllib.request
+import subprocess
 
 class CMDHandler:
     def __init__(self) -> None:
@@ -35,19 +36,51 @@ class CMDHandler:
         
         cmd(args[1:])
 
-def update_address_book(module, id, key):
-    with open('.tcrypt/address_book','a') as addr_book:
-        meta = json.dumps({
-            'module': module,
-            'id': id
-        })
-        addr_book.write('#META: %s\n' % meta)
-        addr_book.write('%s\n' % key)
+class KeyManager:
+    def __init__(self) -> None:
+        self.idenity_file_location = '.git/.tcrypt_key'
+
+    def update_address_book(self, module, id, key):
+        with open('.tcrypt/address_book','a') as addr_book:
+            meta = json.dumps({
+                'module': module,
+                'id': id
+            })
+            addr_book.write('#META: %s\n' % meta)
+            addr_book.write('%s\n' % key)
+
+    def __check_valid_identity(self, identity_file_path: str) -> bool:
+        import secrets
+        n = secrets.token_bytes()
+        encrypted_data = age_encrypt(n)
+        decrypted_data = age_decrypt(encrypted_data, identity_file_path)
+
+        return n == decrypted_data
+    
+    def store_decrypt_identity(self, identity: str):
+        if not self.__check_valid_identity(identity):
+            print("ERROR: Identity is invalid")
+            return
+    
+        with open(self.idenity_file_location,'w') as tcrypt_config:
+            tcrypt_config.write(json.dumps({
+                'identity': identity
+            }))
+
+    def get_decryption_identity(self) -> str:
+        with open(self.idenity_file_location, 'r') as tcrypt_key:
+            key_obj = json.loads(
+                tcrypt_key.read()
+            )
+
+            return key_obj['identity']
 
 def handle_key_add_github(args):
     parser = argparse.ArgumentParser()
     parser.add_argument('username', help='username of the github user to add')
     parsed_args = parser.parse_args(args)
+
+    mgr = KeyManager()
     
     contents = urllib.request.urlopen('https://github.com/%s.keys' % parsed_args.username)
     key_lines = contents.read().decode('utf-8').split('\n')
@@ -55,7 +88,7 @@ def handle_key_add_github(args):
         if key == '':
             continue
 
-        update_address_book('github', parsed_args.username, key)
+        mgr.update_address_book('github', parsed_args.username, key)
     
 
 def handle_key_add(args):
@@ -69,15 +102,13 @@ def handle_key(args):
     key_handler.handle(args)
 
 def age_encrypt(content: bytes) -> bytes:
-    import subprocess
     proc = subprocess.Popen(args=['age','-e','-R','.tcrypt/address_book'],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     result = proc.communicate(input=content)
     return result[0]
 
-def age_decrypt(content: bytes) -> bytes:
-    import subprocess
-    proc = subprocess.Popen(args=['age','-d','-i','%s/.ssh/tcrypt' % os.path.expanduser('~')],
+def age_decrypt(content: bytes, identity_file: str) -> bytes:
+    proc = subprocess.Popen(args=['age','-d','-i',os.path.expanduser(identity_file)],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     result = proc.communicate(input=content)
     return result[0]
@@ -87,7 +118,8 @@ def handle_filter_clean(args):
     sys.stdout.buffer.flush()
 
 def handle_filter_smudge(args):
-    sys.stdout.buffer.write(age_decrypt(sys.stdin.buffer.read()))
+    mgr = KeyManager()
+    sys.stdout.buffer.write(age_decrypt(sys.stdin.buffer.read(),mgr.get_decryption_identity()))
     sys.stdout.buffer.flush()
 
 def handle_filter(args):
@@ -96,7 +128,16 @@ def handle_filter(args):
     filter_handler.add_command('smudge', handle_filter_smudge)
     filter_handler.handle(args)
 
+def set_git_config(key, value):
+    result = subprocess.run(args=['git','config',key, value],
+                            capture_output=True)
+    result.check_returncode()
+
 def handle_init(args):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('identity', help='path to SSH identity file to use for decrypt')
+    parsed_args = parser.parse_args(args)
+
     if not os.path.exists('.tcrypt'):
         os.mkdir('.tcrypt')
 
@@ -105,8 +146,11 @@ def handle_init(args):
         file.write('# tcrypt managed AGE address book, DO NOT MODIFY!\n')
         file.close()
 
-    #TODO: Setup the git filters programmicaly
-    #TODO: Handle the decryption key
+    set_git_config('filter.tcrypt.clean', 'python3 tcrypt.py filter clean')
+    set_git_config('filter.tcrypt.smudge', 'python3 tcrypt.py filter smudge')
+    
+    mgr = KeyManager()
+    mgr.store_decrypt_identity(parsed_args.identity)
 
 def main():
     root_handler = CMDHandler()
